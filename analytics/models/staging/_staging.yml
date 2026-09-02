@@ -1,0 +1,18 @@
+version: 2
+models:
+  - name: stg_orders
+    description: "One row per order, cleaned and typed."
+    columns:
+      - name: order_id
+        description: "Primary key."
+        data_tests:
+          - unique
+          - not_null
+  - name: stg_order_items
+    description: "One row per order line item."
+    columns:
+      - name: order_item_id
+        description: "Primary key."
+        data_tests:
+          - unique
+          - not_null
