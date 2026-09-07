@@ -7,3 +7,7 @@ sources:
       - name: orders
       - name: order_items
       - name: users
+  - name: raw
+    schema: raw
+    tables:
+      - name: products

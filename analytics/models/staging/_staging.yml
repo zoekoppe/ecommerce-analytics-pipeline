@@ -16,3 +16,11 @@ models:
         data_tests:
           - unique
           - not_null
+  - name: stg_products
+    description: "One row per product from the ingested DummyJSON catalog."
+    columns:
+      - name: product_id
+        description: "Primary key."
+        data_tests:
+          - unique
+          - not_null
