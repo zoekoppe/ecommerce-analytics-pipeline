@@ -1,6 +1,6 @@
 # E-commerce Analytics Pipeline
 
-A full ELT pipeline that grabs e-commerce data from a live API, drops it into **Google BigQuery**, and turns it into a clean, tested dimensional model with **dbt**. I built it to show the whole workflow end to end: pulling data in with Python, modeling it in layers, testing it as code, and keeping everything reproducible.
+A full ELT pipeline that grabs e-commerce data from a live API, drops it into **Google BigQuery**, transforms it into a clean, tested dimensional model with **dbt**, and ties the whole thing together with a **Prefect** flow. I built it to show the full workflow end to end: pulling data in with Python, modeling it in layers, testing it as code, orchestrating the steps, and keeping everything reproducible.
 
 ---
 
@@ -15,6 +15,13 @@ DummyJSON API  ──►  raw.products  ──►  stg_products  ──►  dim_
 bigquery-public-data.thelook_ecommerce  ──►  staging (views)  ──►  marts (tables)
         orders, order_items, users             stg_orders           dim_users
                                                 stg_order_items      fct_order_items
+```
+
+A single Prefect flow runs the whole thing in order:
+
+```
+ingest_products  ──►  dbt run  ──►  dbt test
+   (retries)          (build)      (quality gate)
 ```
 
 ### Why two sources?
@@ -39,6 +46,7 @@ The two don't share keys, so they're modeled separately — that's on purpose, j
 | Ingestion (extract + load) | Python (requests, google-cloud-bigquery) |
 | Data warehouse | Google BigQuery |
 | Transformation | dbt Core |
+| Orchestration | Prefect |
 | Environment / dependencies | uv (Python 3.12) |
 | Version control | Git / GitHub |
 
@@ -74,6 +82,19 @@ It's split into tidy extract / transform / load functions, so the same skeleton 
 
 ---
 
+## Orchestration
+
+`src/pipeline.py` is a Prefect flow that runs the whole pipeline — `ingest → dbt run → dbt test` — as one sequence:
+
+- Each step is a Prefect **task**, composed into a **flow**
+- The ingestion task has **retries**, so a flaky network call doesn't kill the run
+- Steps run **in order**, so dbt never builds on missing data — and if the tests fail, that stops the run (a quality gate)
+- A **failure hook** is wired in for alerting (I use Prefect Automations for email alerts)
+
+It runs on demand with a single command, and there's a daily schedule defined in the file that you can switch on with `serve` when you want it running unattended.
+
+---
+
 ## Keeping the data honest
 
 The tests live in the code and run on every build — **11** of them:
@@ -81,7 +102,7 @@ The tests live in the code and run on every build — **11** of them:
 - **Unique + not-null** on every primary key (`order_id`, `order_item_id`, `user_id`, `product_id`)
 - **Referential integrity** — a `relationships` test that checks every `user_id` in `fct_order_items` actually exists in `dim_users`, so nothing's left orphaned
 
-Run `dbt test` to see them — all green right now.
+Run `dbt test` (or the flow) to see them — all green right now.
 
 ---
 
@@ -125,19 +146,34 @@ analytics:
 
 ### Run it
 
-```bash
-# 1. Ingest the product catalog into raw.products
-uv run python src/ingest_products.py
+The whole pipeline, in one command (ingest → build → test), orchestrated by Prefect:
 
-# 2. Build and test the dbt models
+```bash
+uv run python src/pipeline.py
+```
+
+Prefer to run the steps yourself?
+
+```bash
+uv run python src/ingest_products.py     # ingest into raw.products
 cd analytics
-uv run dbt deps        # install packages (dbt_utils)
-uv run dbt run         # build all the models in BigQuery
-uv run dbt test        # run the quality tests
+uv run dbt deps                           # install packages (dbt_utils)
+uv run dbt run                            # build the models
+uv run dbt test                           # run the tests
 uv run dbt docs generate && uv run dbt docs serve   # see the lineage graph
 ```
 
-Heads up: run the ingestion script first. `stg_products` reads from `raw.products`, so that table needs to exist before dbt runs.
+Want the Prefect UI (flow runs, task timeline, logs)? Start it in another terminal:
+
+```bash
+uv run prefect server start               # UI at http://localhost:4200
+```
+
+And to run it on a schedule (daily, unattended) instead of on demand:
+
+```bash
+uv run python src/pipeline.py serve       # leave running; fires on the cron in the file
+```
 
 ---
 
@@ -146,7 +182,8 @@ Heads up: run the ingestion script first. `stg_products` reads from `raw.product
 ```
 .
 ├── src/
-│   └── ingest_products.py      # API → raw BigQuery ingestion
+│   ├── ingest_products.py      # API → raw BigQuery ingestion
+│   └── pipeline.py             # Prefect flow: ingest → run → test
 └── analytics/
     ├── dbt_project.yml
     ├── packages.yml
@@ -170,9 +207,9 @@ Heads up: run the ingestion script first. `stg_products` reads from `raw.product
 
 Where this is headed next:
 
-- **Orchestration with Prefect** — run the whole `ingest → dbt run → dbt test` sequence on a schedule, with alerts when something breaks.
 - **Incremental models** — append on each run and dedup in dbt, then make `fct_order_items` incremental so it only touches new rows.
 - **Ingest carts** — pull DummyJSON carts (they reference product IDs) to build an order fact that joins to `dim_products`.
+- **Deploy the schedule** — run the Prefect flow unattended on a real work pool instead of on demand.
 - **More marts** — revenue and customer-behavior models on top of what's already here.
 
 ---
