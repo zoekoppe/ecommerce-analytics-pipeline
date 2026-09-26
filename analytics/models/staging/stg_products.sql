@@ -1,7 +1,12 @@
 WITH source AS (
     SELECT * FROM {{ source('raw', 'products') }}
-),
-renamed AS (
+)
+,latest AS (
+    SELECT * FROM source
+    QUALIFY ROW_NUMBER() OVER (PARTITION BY product_id 
+                ORDER BY ingested_at DESC) = 1
+)
+,renamed AS (
     SELECT
         product_id,
         title,
@@ -14,6 +19,6 @@ renamed AS (
         sku,
         availability_status,
         ingested_at
-    FROM source
+    FROM latest
 )
 SELECT * FROM renamed

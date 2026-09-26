@@ -113,7 +113,7 @@ def load_to_bigquery(rows: list[dict[str, Any]]) -> None:
         # Replace the table each run: a clean, idempotent snapshot with no
         # duplicates. (See the README note about moving to append + dedup
         # once you add incremental models.)
-        write_disposition=bigquery.WriteDisposition.WRITE_TRUNCATE,
+        write_disposition=bigquery.WriteDisposition.WRITE_APPEND,
     )
 
     logger.info("Loading %d rows into %s", len(rows), table_id)
