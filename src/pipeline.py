@@ -8,7 +8,7 @@ Runs the full sequence, on demand or on a schedule:
 If any step fails, the run stops and the failure hook fires.
 
 Run once, right now:
-    uv run python src/pipeline.py
+    uv run python src/pipeline.py full-refresh
 
 Serve it on a schedule (daily at 6am); leave this running:
     uv run python src/pipeline.py serve
@@ -49,9 +49,13 @@ def ingest_products() -> None:
 
 
 @task
-def dbt_run() -> None:
-    """Build all dbt models."""
-    _run(["dbt", "run"], cwd=ANALYTICS_DIR)
+def dbt_run(full_refresh: bool = False) -> None:
+    """Build all dbt models. Incremental models only process new rows unless
+    full_refresh is set, which rebuilds them from scratch."""
+    command = ["dbt", "run"]
+    if full_refresh:
+        command.append("--full-refresh")
+    _run(command, cwd=ANALYTICS_DIR)
 
 
 @task
@@ -67,11 +71,11 @@ def notify_on_failure(flow, flow_run, state) -> None:
 
 
 @flow(name="ecommerce-elt-pipeline", log_prints=True, on_failure=[notify_on_failure])
-def ecommerce_pipeline() -> None:
+def ecommerce_pipeline(full_refresh: bool = False) -> None:
     """Ingest -> build -> test, in order. Tasks run sequentially, so a failure
     at any step stops the ones after it."""
     ingest_products()
-    dbt_run()
+    dbt_run(full_refresh=full_refresh)
     dbt_test()
 
 
@@ -79,6 +83,9 @@ if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "serve":
         # Long-running process that triggers the pipeline on a schedule.
         ecommerce_pipeline.serve(name="daily", cron="0 6 * * *")
+    elif len(sys.argv) > 1 and sys.argv[1] == "full-refresh":
+        # Run once, rebuilding incremental models from scratch.
+        ecommerce_pipeline(full_refresh=True)
     else:
         # Run the whole pipeline once, immediately.
         ecommerce_pipeline()
