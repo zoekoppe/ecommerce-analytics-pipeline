@@ -14,7 +14,7 @@ DummyJSON API  ──►  raw.products  ──►  stg_products  ──►  dim_
 
 bigquery-public-data.thelook_ecommerce  ──►  staging (views)  ──►  marts (tables)
         orders, order_items, users             stg_orders           dim_users
-                                                stg_order_items      fct_order_items
+                                                stg_order_items      fct_order_items (incremental)
 ```
 
 A single Prefect flow runs the whole thing in order:
@@ -66,7 +66,45 @@ It's a **star schema**, built up in layers so each piece has just one job:
 **Marts** (`models/marts/`, built as **tables**) — the dimensional model, wired together with `ref()` so dbt figures out the build order itself.
 - `dim_users` — one row per user
 - `dim_products` — one row per product (from the ingested catalog)
-- `fct_order_items` — the order-item fact table, with order status and timing
+- `fct_order_items` — the order-item fact table, with order status and timing (built **incrementally**, see below)
+
+---
+
+## Incremental loading
+
+Rebuilding every table from scratch on every run is simple, but the cost grows with the total size of the data. Incremental loading only processes what's **new or changed** since the last run. This project does it at both ends:
+
+- **Ingestion:** products are appended to an append-only raw table and deduped in staging (see [Append, then dedup](#append-then-dedup)).
+- **Fact table:** `fct_order_items` is a dbt `incremental` model that merges in only recent orders.
+
+### How `fct_order_items` works
+
+```sql
+{{ config(materialized='incremental', incremental_strategy='merge', unique_key='order_item_id') }}
+...
+{% if is_incremental() %}
+WHERE created_at >= (
+    SELECT TIMESTAMP_SUB(MAX(created_at), INTERVAL {{ var('incremental_lookback_days', 3) }} DAY)
+    FROM {{ this }}
+)
+{% endif %}
+```
+
+- **First run** (or `--full-refresh`): the table doesn't exist yet, so `is_incremental()` is false and dbt builds the whole table (`CREATE TABLE`).
+- **Later runs:** `is_incremental()` is true, so only orders near or after the newest `created_at` already in the table (`{{ this }}`) are processed.
+- **`merge` on `order_item_id`:** dbt writes with a BigQuery `MERGE`: rows that already exist are updated, new ones are inserted. So re-processing a row never creates a duplicate, and the `unique` test on `order_item_id` checks that.
+- **Lookback window** (`incremental_lookback_days`, default 3 days): orders change status after they're created (processing → shipped → delivered), but `created_at` never changes. Re-processing the last few days picks up those recent status changes.
+
+**The trade-off:** a status change older than the lookback window (say, a return a month later) is missed. That's what a **full refresh** is for: it rebuilds the table from scratch, so run one now and then.
+
+```bash
+cd analytics
+uv run dbt run --select fct_order_items                                     # incremental (MERGE)
+uv run dbt run --select fct_order_items --vars '{incremental_lookback_days: 7}'
+uv run dbt run --select fct_order_items --full-refresh                      # rebuild (CREATE TABLE)
+```
+
+> **Needs billing enabled.** `MERGE` is a DML statement, and the BigQuery Sandbox doesn't allow DML, so incremental runs fail there. With billing on, this project still fits comfortably in BigQuery's free tier (1 TiB of queries and 10 GiB of storage per month).
 
 ---
 
@@ -105,6 +143,7 @@ QUALIFY ROW_NUMBER() OVER (PARTITION BY product_id ORDER BY ingested_at DESC) = 
 - The ingestion task has **retries**, so a flaky network call doesn't kill the run
 - Steps run **in order**, so dbt never builds on missing data — and if the tests fail, that stops the run (a quality gate)
 - A **failure hook** is wired in for alerting (I use Prefect Automations for email alerts)
+- A **`full_refresh`** flow parameter passes `--full-refresh` to `dbt run`, rebuilding the incremental models from scratch
 
 It runs on demand with a single command, and there's a daily schedule defined in the file that you can switch on with `serve` when you want it running unattended.
 
@@ -124,7 +163,13 @@ Run `dbt test` (or the flow) to see them — all green right now.
 ## Try it yourself
 
 ### You'll need
-- A Google Cloud project with **BigQuery** on (the free Sandbox is plenty — no billing needed)
+- A Google Cloud project with **BigQuery** on and **billing enabled**. The incremental model writes with `MERGE`, which the free Sandbox blocks. The project still fits in BigQuery's free tier, so set a small budget alert (Billing → Budgets & alerts) as a safety net.
+  - If you're upgrading an existing Sandbox project, remove its 60-day table expiration too, or your tables (including the raw product history) will be deleted:
+    ```sql
+    ALTER SCHEMA `your-project.raw`     SET OPTIONS (default_table_expiration_days = NULL);
+    ALTER SCHEMA `your-project.dbt_dev` SET OPTIONS (default_table_expiration_days = NULL);
+    ALTER TABLE  `your-project.raw.products` SET OPTIONS (expiration_timestamp = NULL);
+    ```
 - [`uv`](https://docs.astral.sh/uv/) installed
 - The [Google Cloud CLI](https://cloud.google.com/sdk/docs/install) (`gcloud`) installed
 
@@ -173,7 +218,7 @@ Prefer to run the steps yourself?
 uv run python src/ingest_products.py     # append a new batch to raw.products
 cd analytics
 uv run dbt deps                           # install packages (dbt_utils)
-uv run dbt run                            # build the models
+uv run dbt run                            # build the models (fct_order_items incrementally)
 uv run dbt test                           # run the tests
 uv run dbt docs generate && uv run dbt docs serve   # see the lineage graph
 ```
@@ -182,6 +227,12 @@ Want the Prefect UI (flow runs, task timeline, logs)? Start it in another termin
 
 ```bash
 uv run prefect server start               # UI at http://localhost:4200
+```
+
+To rebuild the incremental models from scratch as part of the flow:
+
+```bash
+uv run python src/pipeline.py full-refresh
 ```
 
 And to run it on a schedule (daily, unattended) instead of on demand:
@@ -198,7 +249,7 @@ uv run python src/pipeline.py serve       # leave running; fires on the cron in 
 .
 ├── src/
 │   ├── ingest_products.py      # API → raw BigQuery ingestion (append)
-│   └── pipeline.py             # Prefect flow: ingest → run → test
+│   └── pipeline.py             # Prefect flow: ingest → run → test (optional full refresh)
 └── analytics/
     ├── dbt_project.yml
     ├── packages.yml
@@ -213,7 +264,7 @@ uv run python src/pipeline.py serve       # leave running; fires on the cron in 
             ├── _marts.yml      # marts tests + docs
             ├── dim_users.sql
             ├── dim_products.sql
-            └── fct_order_items.sql
+            └── fct_order_items.sql   # incremental (merge)
 ```
 
 ---
@@ -222,7 +273,7 @@ uv run python src/pipeline.py serve       # leave running; fires on the cron in 
 
 Where this is headed next:
 
-- **Incremental models** — ✅ product ingestion now appends on each run and dedups in dbt. Next: make `fct_order_items` incremental so it only touches new rows. (That needs billing enabled on the GCP project: incremental models write with `MERGE`, and the BigQuery Sandbox doesn't allow DML.)
+- ~~**Incremental models**~~ — ✅ done: append-only product ingestion with dedup in staging, and an incremental `fct_order_items` (see [Incremental loading](#incremental-loading)).
 - **Product history (SCD Type 2)** — the append-only `raw.products` already keeps every snapshot, so a dbt snapshot could track how prices and stock change over time.
 - **Ingest carts** — pull DummyJSON carts (they reference product IDs) to build an order fact that joins to `dim_products`.
 - **Deploy the schedule** — run the Prefect flow unattended on a real work pool instead of on demand.
