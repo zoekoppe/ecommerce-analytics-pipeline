@@ -10,7 +10,7 @@ Two e-commerce data sources flow through the same dbt layers — **staging** (li
 
 ```
 DummyJSON API  ──►  raw.products  ──►  stg_products  ──►  dim_products
-   (Python EL)
+   (Python EL)       (append-only)      (dedup to latest)
 
 bigquery-public-data.thelook_ecommerce  ──►  staging (views)  ──►  marts (tables)
         orders, order_items, users             stg_orders           dim_users
@@ -61,7 +61,7 @@ It's a **star schema**, built up in layers so each piece has just one job:
 **Staging** (`models/staging/`, built as **views**) — one model per source table, just renaming and fixing types. No joins here.
 - `stg_orders` — one row per order
 - `stg_order_items` — one row per order line item
-- `stg_products` — one row per ingested product
+- `stg_products` — one row per product (the latest version from the append-only raw table)
 
 **Marts** (`models/marts/`, built as **tables**) — the dimensional model, wired together with `ref()` so dbt figures out the build order itself.
 - `dim_users` — one row per user
@@ -76,9 +76,24 @@ It's a **star schema**, built up in layers so each piece has just one job:
 
 - **Extract** — grabs the whole product catalog from the DummyJSON API in one request
 - **Transform** — flattens each product into a flat row and keeps the fields worth keeping
-- **Load** — spins up the `raw` dataset/table if it's not there yet (with an explicit schema, so types are locked in rather than guessed) and loads the rows, tagging each with an `ingested_at` time
+- **Load** — spins up the `raw` dataset/table if it's not there yet (with an explicit schema, so types are locked in rather than guessed) and **appends** the rows as a new batch, tagging each with an `ingested_at` time
 
 It's split into tidy extract / transform / load functions, so the same skeleton works against pretty much any API — you just swap the URL and the field mapping.
+
+### Append, then dedup
+
+Each run **appends** the whole catalog to `raw.products` (`WRITE_APPEND`) instead of overwriting it. That makes the raw table an append-only history — one batch per run, all sharing the same `ingested_at` — so:
+
+- a bad API response can't wipe out good data that's already loaded, and
+- every past snapshot is kept, so price and stock changes can be tracked over time later.
+
+The trade-off is that the same `product_id` now shows up once per run. Cleaning that up is dbt's job: `stg_products` keeps only the newest version of each product with a window function.
+
+```sql
+QUALIFY ROW_NUMBER() OVER (PARTITION BY product_id ORDER BY ingested_at DESC) = 1
+```
+
+`ROW_NUMBER()` numbers each product's versions from newest (1) to oldest, and `QUALIFY` keeps just row 1. The `unique` test on `stg_products.product_id` is the guard: if the dedup ever breaks, the build fails.
 
 ---
 
@@ -99,7 +114,7 @@ It runs on demand with a single command, and there's a daily schedule defined in
 
 The tests live in the code and run on every build — **11** of them:
 
-- **Unique + not-null** on every primary key (`order_id`, `order_item_id`, `user_id`, `product_id`)
+- **Unique + not-null** on every primary key (`order_id`, `order_item_id`, `user_id`, `product_id`) — on `stg_products` this also proves the dedup works, since the raw table holds one copy of each product per run
 - **Referential integrity** — a `relationships` test that checks every `user_id` in `fct_order_items` actually exists in `dim_users`, so nothing's left orphaned
 
 Run `dbt test` (or the flow) to see them — all green right now.
@@ -155,7 +170,7 @@ uv run python src/pipeline.py
 Prefer to run the steps yourself?
 
 ```bash
-uv run python src/ingest_products.py     # ingest into raw.products
+uv run python src/ingest_products.py     # append a new batch to raw.products
 cd analytics
 uv run dbt deps                           # install packages (dbt_utils)
 uv run dbt run                            # build the models
@@ -182,7 +197,7 @@ uv run python src/pipeline.py serve       # leave running; fires on the cron in 
 ```
 .
 ├── src/
-│   ├── ingest_products.py      # API → raw BigQuery ingestion
+│   ├── ingest_products.py      # API → raw BigQuery ingestion (append)
 │   └── pipeline.py             # Prefect flow: ingest → run → test
 └── analytics/
     ├── dbt_project.yml
@@ -193,7 +208,7 @@ uv run python src/pipeline.py serve       # leave running; fires on the cron in 
         │   ├── _staging.yml    # staging tests + docs
         │   ├── stg_orders.sql
         │   ├── stg_order_items.sql
-        │   └── stg_products.sql
+        │   └── stg_products.sql   # dedups to the latest version
         └── marts/
             ├── _marts.yml      # marts tests + docs
             ├── dim_users.sql
@@ -207,7 +222,8 @@ uv run python src/pipeline.py serve       # leave running; fires on the cron in 
 
 Where this is headed next:
 
-- **Incremental models** — append on each run and dedup in dbt, then make `fct_order_items` incremental so it only touches new rows.
+- **Incremental models** — ✅ product ingestion now appends on each run and dedups in dbt. Next: make `fct_order_items` incremental so it only touches new rows. (That needs billing enabled on the GCP project: incremental models write with `MERGE`, and the BigQuery Sandbox doesn't allow DML.)
+- **Product history (SCD Type 2)** — the append-only `raw.products` already keeps every snapshot, so a dbt snapshot could track how prices and stock change over time.
 - **Ingest carts** — pull DummyJSON carts (they reference product IDs) to build an order fact that joins to `dim_products`.
 - **Deploy the schedule** — run the Prefect flow unattended on a real work pool instead of on demand.
 - **More marts** — revenue and customer-behavior models on top of what's already here.
